@@ -25,11 +25,14 @@ use strict;
 
 use Getopt::Std;
 use Term::ReadKey;
+use DateTime;
+use DateTime::TimeZone;
 use FileHandle;
 use File::Basename;
 use Term::ReadKey;
 use Math::Trig;
-use List::Util qw(first);
+use List::Util qw(first all);
+use List::MoreUtils qw(uniq);
 use DBI;
 use LPG::prompt qw(prompt_init prompt_for_value prompt_menu);
 use LPG::SQLO;
@@ -43,7 +46,7 @@ use URI::Escape;
 
 use JSON;
 
-our ($opt_h, $opt_d, $opt_v, $opt_n, $opt_u, $opt_r, $opt_R, $opt_S, $opt_A, $opt_f);
+our ($opt_h, $opt_d, $opt_v, $opt_n, $opt_D, $opt_u, $opt_r, $opt_R, $opt_S, $opt_A, $opt_f);
 
 # -h                   :: print usage information.
 # -d                   :: enable debugging output.
@@ -56,7 +59,7 @@ our ($opt_h, $opt_d, $opt_v, $opt_n, $opt_u, $opt_r, $opt_R, $opt_S, $opt_A, $op
 # -R <#>               :: randomly select # dealers
 # -S <#>               :: sleep for # seconds between accounts
 
-getopts( 'hdvAfn:u:r:R:S:' );
+getopts( 'hdvAfnD:u:r:R:S:' );
 
 $| = 1;
 
@@ -88,7 +91,7 @@ if ($opt_h) {
     exit;
 }
 
-if (!defined( $opt_n )) {
+if (!defined( $opt_D )) {
     usage();
     exit;
 }
@@ -104,14 +107,14 @@ prompt_init();
 
 ########################## SQL UPDATE FILE CHECK/SELECTION ##########################
 if (!defined $opt_u) {
-    $opt_u = sprintf( $DEFAULT_UPDATE_FILENAME_FORMAT, $opt_n );
+    $opt_u = sprintf( $DEFAULT_UPDATE_FILENAME_FORMAT, $opt_D );
     printf( "No update SQL file specified, using default '%s'\n", $opt_u ) if ($opt_d);
 }
 sql_file_check($opt_u);
 
 ########################## SQL REVERT FILE CHECK/SELECTION ##########################
 if (!defined $opt_r) {
-    $opt_r = sprintf( $DEFAULT_REVERT_FILENAME_FORMAT, $opt_n );
+    $opt_r = sprintf( $DEFAULT_REVERT_FILENAME_FORMAT, $opt_D );
     printf( "No revert SQL file specified, using default '%s'\n", $opt_r ) if ($opt_d);
 }
 sql_file_check($opt_r);
@@ -120,7 +123,7 @@ sql_file_check($opt_r);
 ########################## DATABASE CONNECTION INIT ##########################
 
 # Create a connection to the Social DB
-my $dbo = LPG::SQLO->new($LPG::SQL_SOCIAL::social_db_normal_site_names{$opt_n}, \%LPG::SQL_SOCIAL::social_db_definitions);
+my $dbo = LPG::SQLO->new($LPG::SQL_SOCIAL::social_db_normal_site_names{$opt_D}, \%LPG::SQL_SOCIAL::social_db_definitions);
 
 if (!defined $dbo || !defined $dbo->{status}) {
     if (defined $dbo->{error}) {
@@ -138,14 +141,14 @@ if (!defined( $connection )) {
     exit;
 }
 
-my $sth = $connection->column_info( undef, undef, "temp_active_accounts", undef );
-my $temp_active_accounts_columns = $sth->fetchall_hashref( 'COLUMN_NAME' );
+my $sth = $connection->column_info( undef, undef, "temp_active_dealers", undef );
+my $temp_active_dealers_columns = $sth->fetchall_hashref( 'COLUMN_NAME' );
 
 
 ########################## GENERATE DATABASE QUERY ##########################
 my $query = "";
 if ($opt_A || $opt_R) {
-    $query = "select * from temp_active_accounts;";
+    $query = "select * from temp_active_dealers;";
     if (scalar @ARGV > 0) {
         print STDERR $YELLOW, "WARNING: Extra arguments being ignored because ", $WHITE, ($opt_A ? "-A" : "-R"), $YELLOW
             ,
@@ -154,8 +157,8 @@ if ($opt_A || $opt_R) {
 }
 elsif (scalar @ARGV > 0) {
     my @quoted_dealer_ids = map { $connection->quote( $_,
-        $temp_active_accounts_columns->{dealer_id}->{DATA_TYPE} ); } @ARGV;
-    $query = sprintf( "select * from temp_active_accounts where dealer_id in (%s);", join( ",", @quoted_dealer_ids ) );
+        $temp_active_dealers_columns->{dealer_id}->{DATA_TYPE} ); } @ARGV;
+    $query = sprintf( "select * from temp_active_dealers where dealer_id in (%s);", join( ",", @quoted_dealer_ids ) );
 }
 else {
     print STDERR $RED, "Nothing to do.\n", $NORM;
@@ -201,28 +204,21 @@ my %accounts = ();
 foreach my $row (@$rows) {
     $accounts{$row->{dealer_id}} = $row;
 }
-my @account_ids = sort keys %accounts;
-
-
-##################### Create Browser Like Thing #####################
-my $browser = LWP::UserAgent->new;
-$browser->ssl_opts( verify_hostname => 0 );
 
 
 ################# CATEGORIZE the ACCOUNTS #####################
-my %locations = ();
 my @no_geo_location = ();
 my @no_location_at_all = ();
 my @no_address = ();
-foreach my $account_id (@account_ids) {
+foreach my $account_id (sort keys %accounts) {
     my $account = $accounts{$account_id};
 
-    if (!defined( $account->{latitude} ) || $account->{latitude} eq "" || !defined( $account->{longitude} ) || $account->{longitude} eq "") {
+    if (isNullOrEmpty( $account->{latitude} ) || isNullOrEmpty( $account->{longitude} )) {
         # no geographic coordinates
-        if (!defined( $account->{address1} ) || $account->{address1} eq "" ||
-            !defined( $account->{city} ) || $account->{city} eq "" ||
-            !defined( $account->{state} ) || $account->{state} eq "" ||
-            !defined( $account->{country} ) || $account->{country} eq "")
+        if (isNullOrEmpty( $account->{address1} ) ||
+            isNullOrEmpty( $account->{city} ) ||
+            isNullOrEmpty( $account->{state} ) ||
+            isNullOrEmpty( $account->{country} ))
         {
             push @no_location_at_all, $account_id;
         }
@@ -233,24 +229,19 @@ foreach my $account_id (@account_ids) {
     else {
         # latitude and longitude present
         # do they have an address on file too?
-        if (!defined( $account->{address1} ) || $account->{address1} eq "" ||
-            !defined( $account->{city} ) || $account->{city} eq "" ||
-            !defined( $account->{state} ) || $account->{state} eq "" ||
-            !defined( $account->{country} ) || $account->{country} eq "")
+        if (isNullOrEmpty( $account->{address1} ) ||
+            isNullOrEmpty( $account->{city} ) ||
+            isNullOrEmpty( $account->{state} ) ||
+            isNullOrEmpty( $account->{country} ))
         {
             # no address,
             push @no_address, $account_id;
         }
-
-        # collect accounts with common locations to minimize the number of API requests.
-        my $key = $account->{latitude}.",".$account->{longitude};
-        push @{$locations{$key}}, $account_id;
     }
 }
 
 
-################# NOT ENOUGH ADDRESS and NO LAT/LON #####################
-########### Remove this from our overall list of accounts ###############
+###############  NOT ENOUGH ADDRESS and NO LAT/LON, so Remove from the accounts list  ###############
 if (scalar @no_location_at_all > 0) {
     printf( "%sThe following %d dealers have no known address nor geographic coordinates.\n%s", $RED,
         scalar @no_location_at_all, $NORM );
@@ -259,12 +250,13 @@ if (scalar @no_location_at_all > 0) {
         my $account = $accounts{$account_id};
 
         print "    ", $YELLOW, $account->{dealer_id}, ": ", $WHITE;
-        printf( "%s, %s, %s %s, %s\n",
+        printf( "%s, %s, %s %s, %s%s\n",
             $account->{address1} || "<street address>",
             $account->{city} || "<city>",
             $account->{state} || "<state>",
             $account->{postalcode} || "<postal code>",
-            $account->{country} || "<country>" );
+            $account->{country} || "<country>",
+            $NORM);
 
         # remove it from the accounts collection, there's nothing we can do.
         delete $accounts{$account_id};
@@ -272,7 +264,27 @@ if (scalar @no_location_at_all > 0) {
 }
 
 
-################# NO LAT/LON (HOWEVER ADDRESS IS PRESENT) #####################
+
+##################### Create Browser Like Thing #####################
+my $browser = LWP::UserAgent->new;
+$browser->ssl_opts( verify_hostname => 0 );
+
+
+if ($opt_r) {
+    $rfh = FileHandle->new( $opt_r, "a" );
+    if (!defined $rfh) {
+        printf( STDERR "Failed to open '%s' for append. (%s%s%s)\n", $opt_r, $RED, $!, $NORM );
+    }
+}
+if ($opt_u) {
+    $ufh = FileHandle->new( $opt_u, "a" );
+    if (!defined $ufh) {
+        printf( STDERR "Failed to open '%s' for append. (%s%s%s)\n", $opt_u, $RED, $!, $NORM );
+    }
+}
+
+
+############### NO LAT/LON (HOWEVER ADDRESS IS PRESENT), so lookup lat/lng ###############
 if (scalar @no_geo_location > 0) {
     printf( "%s%d dealers with no latitude/longitude stored.\n%s", $YELLOW, scalar @no_geo_location, $NORM );
 
@@ -288,31 +300,47 @@ if (scalar @no_geo_location > 0) {
             $account->{postalcode} || "<postal code>",
             $account->{country} || "<country>" );
 
-        ## look up the latitude and longitude using the address
-        ## -- $geo is a hash with "status", "latitude" and "longitude" fields.
-        my $geo = get_geoloc( $browser, $account );
+        if (!$opt_n) {
+            ## look up the latitude and longitude using the address
+            ## -- $geo is a hash with "status", "latitude" and "longitude" fields.
+            my $geo = get_geoloc( $browser, $account );
 
-        if (defined( $geo ) && $geo->{status} eq "OK") {
+            if (defined( $geo )) {
+                my $update_location = "update temp_active_dealers set latitude=%s, longitude=%s where dealer_id=%s;";
+                my $revert_command = sprintf( $update_location,
+                    $connection->quote( $accounts{$account_id}->{latitude}, $info->{timeZone}->{DATA_TYPE} ),
+                    $connection->quote( $accounts{$account_id}->{longitude}, $info->{timeZone}->{DATA_TYPE} ),
+                    $connection->quote( $account->{dealer_id}, $info->{dealer_id}->{DATA_TYPE} ) );
 
-            $accounts{$account_id}->{latitude} = $geo->{latitude};
-            $accounts{$account_id}->{longitude} = $geo->{longitude};
+                my $update_command = sprintf( $update_location,
+                    $connection->quote( $geo->{latitude}, $info->{timeZone}->{DATA_TYPE} ),
+                    $connection->quote( $geo->{longitude}, $info->{timeZone}->{DATA_TYPE} ),
+                    $connection->quote( $account->{dealer_id}, $info->{dealer_id}->{DATA_TYPE} ) );
 
-            my $key = $geo->{latitude}.",".$geo->{longitude};
-            push @{$locations{$key}}, $account_id;
-        }
+                if (defined $rfh) {
+                    $rfh->printf( "%s\n", $revert_command );
+                }
+                if (defined $ufh) {
+                    $ufh->printf( "%s\n", $update_command );
+                }
 
-        $left--;
+                $accounts{$account_id}->{latitude} = $geo->{latitude};
+                $accounts{$account_id}->{longitude} = $geo->{longitude};
+            }
 
-        if ($left > 0) {
-            my $sleep_time = int( rand( $sleep_target ) );
-            printf( "Sleeping for %d seconds.\n", $sleep_time ) if $opt_d;
-            sleep $sleep_time;
+            $left--;
+
+            if ($left > 0) {
+                my $sleep_time = int( rand( $sleep_target ) );
+                printf( "Sleeping for %d seconds.\n", $sleep_time ) if $opt_d;
+                sleep $sleep_time;
+            }
         }
     }
 }
 
 
-################# NO ADDRESS (HOWEVER LAT/LON IS PRESENT) #####################
+############### NO ADDRESS (HOWEVER LAT/LON IS PRESENT), so lookup address ###############
 if (scalar @no_address > 0) {
     printf( "%s%d accounts with no address information.\n%s", $YELLOW, scalar @no_address, $NORM );
 
@@ -323,9 +351,9 @@ if (scalar @no_address > 0) {
         print $GREEN, $account->{dealer_id}, " :: ", $YELLOW, "no address though lat/lon location known.\n", $NORM;
 
         # disable until we save the updated address
-        if (0) {
+        if (!$opt_n) {
             ## look up the address using the latitude and longitude
-            my $revgeo = get_google_reverse_geoloc_info( $browser, $account->{latitude}, $account->{longitude} );
+            my $revgeo = get_reverse_geoloc( $browser, $account->{latitude}, $account->{longitude} );
 
             if (defined( $revgeo )) {
 
@@ -364,25 +392,10 @@ if (scalar @no_address > 0) {
     }
 }
 
-if ($opt_r) {
-    $rfh = FileHandle->new( $opt_r, "a" );
-    if (!defined $rfh) {
-        printf( STDERR "Failed to open '%s' for append. (%s%s%s)\n", $opt_r, $RED, $!, $NORM );
-    }
-}
-if ($opt_u) {
-    $ufh = FileHandle->new( $opt_u, "a" );
-    if (!defined $ufh) {
-        printf( STDERR "Failed to open '%s' for append. (%s%s%s)\n", $opt_u, $RED, $!, $NORM );
-    }
-}
-
-# shouldn't need to do this
-# @account_ids = sort keys %accounts;
 
 # At this point should have address and geo coordinates
 my $left = scalar @$rows;
-foreach my $account_id (@account_ids) {
+foreach my $account_id (sort keys %accounts) {
     print $HIGREEN, "\n===== ", $account_id, " =====\n", $NORM;
     my $account = $accounts{$account_id};
 
@@ -410,46 +423,67 @@ foreach my $account_id (@account_ids) {
         $account->{longitude} || "<unknown>",
         $NORM );
 
-    my $tz = get_google_timezone_info( $browser, $account->{latitude}, $account->{longitude} );
+    if (!$opt_n) {
+        my $tz = get_timezone( $browser, $account->{latitude}, $account->{longitude} );
 
-    if (defined( $tz )) {
-        # warn if timezone offset differs from the one stored in the database
-        my $hours_offset = ($tz->{rawOffset} + $tz->{dstOffset}) / 3600.0;
-        print $account->{dealer_id}, ": ", $GREEN, $tz->{timeZoneName}, " (", $tz->{timeZoneId}, ") an offset of ",
-            $hours_offset, " hours\n", $NORM;
+        if (defined( $tz )) {
+            # warn if timezone offset differs from the one stored in the database
+            print $account->{dealer_id}, ": ", $GREEN, $tz->{timeZoneName}, " (", $tz->{timeZoneId}, ") an offset of ",
+                $tz->{hours_offset}, " hours\n", $NORM;
 
-        if (!defined( $account->{timeZone} ) || ($account->{timeZone} != $hours_offset)) {
-            print $account->{dealer_id}, ": ", $RED, "Timezone offset in database, ",
-                (defined( $account->{timeZone} ) ? $account->{timeZone} : "<undefined>"),
-                ", does not match what Google is telling us, ", $hours_offset, $NORM, "\n";
+            if (!defined( $account->{timeZone} ) || ($account->{timeZone} != $tz->{hours_offset})) {
+                print $account->{dealer_id}, ": ", $RED, "Timezone offset in database, ",
+                    (defined( $account->{timeZone} ) ? $account->{timeZone} : "<undefined>"),
+                    ", does not match ", $tz->{hours_offset}, " received via the API.", $NORM, "\n";
+
+                # timeZoneId property :: create the commands to revert and update
+                my $update_timeZone = "update temp_active_dealers set timeZone=%s where dealer_id=%s;";
+                my $old_timezone = defined $account->{timeZone} ? ($account->{timeZone} eq "NULL" ? "NULL" : sprintf("%d", $account->{timeZone})) : "NULL";
+                my $revert_command = sprintf( $update_timeZone,
+                    $connection->quote( $old_timezone, $info->{timeZone}->{DATA_TYPE} ),
+                    $connection->quote( $account->{dealer_id}, $info->{dealer_id}->{DATA_TYPE} ) );
+
+                my $update_command = sprintf( $update_timeZone,
+                    $connection->quote( sprintf("%d", $tz->{hours_offset}), $info->{timeZone}->{DATA_TYPE} ),
+
+                    $connection->quote( $account->{dealer_id}, $info->{dealer_id}->{DATA_TYPE} ) );
+
+                if (defined $rfh) {
+                    $rfh->printf( "%s\n", $revert_command );
+                }
+                if (defined $ufh) {
+                    $ufh->printf( "%s\n", $update_command );
+                }
+            }
+
+            # timeZoneId property :: create the commands to revert and update
+            my $update_timeZoneId = "update temp_active_dealers set timeZoneId=%s where dealer_id=%s;";
+            my $revert_command = sprintf( $update_timeZoneId,
+                $connection->quote( $account->{timeZoneId}, $info->{timeZoneId}->{DATA_TYPE} ),
+                $connection->quote( $account->{dealer_id}, $info->{dealer_id}->{DATA_TYPE} ) );
+
+            my $update_command = sprintf( $update_timeZoneId,
+                $connection->quote( $tz->{timeZoneId}, $info->{timeZoneId}->{DATA_TYPE} ),
+                $connection->quote( $account->{dealer_id}, $info->{dealer_id}->{DATA_TYPE} ) );
+
+            if (defined $rfh) {
+                $rfh->printf( "%s\n", $revert_command );
+            }
+            if (defined $ufh) {
+                $ufh->printf( "%s\n", $update_command );
+            }
+
+            # update the accounts map entry in case I want to use it later
+            $accounts{$account_id}->{timeZoneId} = $tz->{timeZoneId};
         }
 
-        # create the commands to revert and update the timeZoneId property
-        my $revert_command = sprintf( "update temp_active_accounts set timeZoneId=%s where dealer_id=%s;",
-            $connection->quote( $account->{timeZoneId}, $info->{timeZoneId}->{DATA_TYPE} ),
-            $connection->quote( $account->{dealer_id}, $info->{dealer_id}->{DATA_TYPE} ) );
+        $left--;
 
-        my $update_command = sprintf( "update temp_active_accounts set timeZoneId=%s where dealer_id=%s;",
-            $connection->quote( $tz->{timeZoneId}, $info->{timeZoneId}->{DATA_TYPE} ),
-            $connection->quote( $account->{dealer_id}, $info->{dealer_id}->{DATA_TYPE} ) );
-
-        if (defined $rfh) {
-            $rfh->printf( "%s\n", $revert_command );
+        if ($left > 0) {
+            my $sleep_time = int( rand( $sleep_target ) );
+            printf( "Sleeping for %d seconds.\n", $sleep_time ) if $opt_d;
+            sleep $sleep_time;
         }
-        if (defined $ufh) {
-            $ufh->printf( "%s\n", $update_command );
-        }
-
-        # update the accounts map entry in case I want to use it later
-        $accounts{$account_id}->{timeZoneId} = $tz->{timeZoneId};
-    }
-
-    $left--;
-
-    if ($left > 0) {
-        my $sleep_time = int( rand( $sleep_target ) );
-        printf( "Sleeping for %d seconds.\n", $sleep_time ) if $opt_d;
-        sleep $sleep_time;
     }
 }
 
@@ -463,15 +497,66 @@ if (defined $ufh) {
 exit;
 
 
+# function: get_geoloc
+# @params: account hash
+# @returns hash with the following fields:
+# - status
+# - latitde
+# - longitude
+sub get_geoloc {
+    my ($browser, $data_item) = @_;
+    my $result = undef;
+
+    if ($geo_service eq "google") {
+        $result = get_google_geoloc_info($browser, $data_item);
+    }
+    elsif ($geo_service eq "ziptastic") {
+        $result = get_ziptastic_geoloc_info($browser, $data_item);
+    }
+
+    return $result;
+}
+
+sub get_ziptastic_geoloc_info {
+    my ($browser, $account) = @_;
+
+    print "Using Ziptastic to lookup the lat/lng for the location, $account->{postalcode}\n" if $opt_d;
+
+    my $ziptastic_geoloc_api_url = sprintf( "https://zip.getziptastic.com/v3/%s/%s", substr($account->{country},0,2), substr($account->{postalcode},0,5) );
+
+    my $response = $browser->get( $ziptastic_geoloc_api_url, 'x-key' => '5893afab93d2dd2f6b111d70b06e92c4702b7044' );
+
+    if (!$response->is_success) {
+        print $RED, "Can't get $ziptastic_geoloc_api_url -- ", $NORM, $response->status_line, "\n";
+    }
+    else {
+        print $GREEN, "GET $ziptastic_geoloc_api_url -- ", $NORM, $response->status_line, "\n";
+
+        if ($opt_d) {
+            print $GREEN, "content_type: ", $WHITE, $response->content_type, $NORM, "\n";
+            print $RED, "response:\n", $NORM, $response->content, "\n";
+        }
+
+        my $result = decode_json $response->content;
+
+        return {
+            "latitude"  => ${$result}[0]->{latitude},
+            "longitude" => ${$result}[0]->{longitude}
+        };
+    }
+
+    return undef;
+}
+
 
 sub get_google_geoloc_info {
-    my ($browser, $item) = @_;
+    my ($browser, $account) = @_;
 
-    my $address = sprintf( "%s, %s, %s  %s", $item->{address1}, $item->{city}, $item->{state}, $item->{postalcode} );
+    my $address = sprintf( "%s, %s, %s  %s", $account->{address1}, $account->{city}, $account->{state}, $account->{postalcode} );
 
-    printf( "%s%s%s :: %s %s(Lat: %s, Lon: %s)%s\n", $GREEN, $item->{dealer_id}, $WHITE, $address, $YELLOW,
-        $item->{latitude} || "<unknown>",
-        $item->{longitude} || "<unknown>", $NORM );
+    printf( "%s%s%s :: %s %s(Lat: %s, Lon: %s)%s\n", $GREEN, $account->{dealer_id}, $WHITE, $address, $YELLOW,
+        $account->{latitude} || "<unknown>",
+        $account->{longitude} || "<unknown>", $NORM );
 
     my $google_geocode_api_url = sprintf( "https://maps.googleapis.com/maps/api/geocode/json?address=%s&key=%s",
         uri_escape( $address ), "AIzaSyAT-FsZkd7HuxZDHGk5HUofnzN71ZrFxHA" );
@@ -481,7 +566,7 @@ sub get_google_geoloc_info {
         print $RED, "Can't get $google_geocode_api_url -- ", $NORM, $response->status_line, "\n";
     }
     else {
-        print $GREEN, "Found $google_geocode_api_url -- ", $NORM, $response->status_line, "\n";
+        print $GREEN, "GET $google_geocode_api_url -- ", $NORM, $response->status_line, "\n";
 
         print $GREEN, "content_type: ", $WHITE, $response->content_type, $NORM, "\n";
 
@@ -497,13 +582,12 @@ sub get_google_geoloc_info {
 
             if ($opt_d) {
                 print "Found via Google Geocoding API, ";
-                printf( "%s%s%s :: %s %s(Lat: %s, Lon: %s)%s\n", $GREEN, $item->{dealer_id}, $WHITE,
+                printf( "%s%s%s :: %s %s(Lat: %s, Lon: %s)%s\n", $GREEN, $account->{dealer_id}, $WHITE,
                     $result->{formatted_address}, $YELLOW,
                     $result->{geometry}->{location}->{lat}, $result->{geometry}->{location}->{lng}, $NORM );
             }
 
             return {
-                "status"    => $resultref->{status},
                 "latitude"  => $result->{geometry}->{location}->{lat},
                 "longitude" => $result->{geometry}->{location}->{lng},
             };
@@ -519,10 +603,81 @@ sub get_google_geoloc_info {
     return undef;
 }
 
+
+# function: get_reverse_geoloc
+# @params: latitude, longitude
+# @returns hash with the following fields
+#  - address1
+#  - city
+#  - state
+#  - country
+#  - postalcode
+sub get_reverse_geoloc {
+    my ($browser, $target_postalcode, $latitude, $longitude) = @_;
+    my $result = undef;
+
+    if ($geo_service eq "google") {
+        $result = get_google_reverse_geoloc_info($browser, $latitude, $longitude);
+    }
+    elsif ($geo_service eq "ziptastic") {
+        $result = get_ziptastic_reverse_geoloc_info($browser, $target_postalcode, $latitude, $longitude);
+    }
+
+    return $result;
+}
+
+sub get_ziptastic_reverse_geoloc_info {
+    my ($browser, $target_postalcode, $latitude, $longitude) = @_;
+
+    print "Using Ziptastic to lookup the address for the location, $latitude,$longitude\n" if $opt_d;
+
+    my $ziptastic_reverse_geoloc_api_url = sprintf("https://zip.getziptastic.com/v3/reverse/%s/%s", $latitude, $longitude );
+
+    my $response = $browser->get( $ziptastic_reverse_geoloc_api_url, 'x-key' => '5893afab93d2dd2f6b111d70b06e92c4702b7044' );
+
+    if (!$response->is_success) {
+        print $RED, "Can't get $ziptastic_reverse_geoloc_api_url -- ", $NORM, $response->status_line, "\n";
+    }
+    else {
+        print $GREEN, "GET $ziptastic_reverse_geoloc_api_url -- ", $NORM, $response->status_line, "\n";
+
+        if ($opt_d) {
+            print $GREEN, "content_type: ", $WHITE, $response->content_type, $NORM, "\n";
+            print $RED, "response:\n", $NORM, $response->content, "\n";
+        }
+
+        my $result = decode_json $response->content;
+
+        # $result is an array ref
+        my @zips = map { $_->{postal_code} } @{$result};
+        my @zones = map { $_->{timezone} } @{$result};
+        my @uniq_zones = uniq @zones;
+        my $all_or_nothing = (scalar @uniq_zones == 1);
+        printf("%d zip codes found (%s) %s %s\n", scalar @zips, join(", ", @zips),
+                $all_or_nothing ? "all in" : "in timezones ",
+                $all_or_nothing ? $zones[0] : join(", ", @uniq_zones));
+
+        my $match = ${$result}[0];
+        if (defined $target_postalcode) {
+            $match = first { $_->{postal_code} eq $target_postalcode } @{$result} || ${$result}[0];
+        }
+
+        return {
+            address1 => undef,
+            city => $match->{city},
+            state => $match->{state_short},
+            country => $match->{country},
+            postalcode => $match->{postal_code}
+        };
+    }
+
+    return undef;
+}
+
 sub get_google_reverse_geoloc_info {
     my ($browser, $latitude, $longitude) = @_;
 
-    print "Looking up the address for the location, $latitude,$longitude\n" if $opt_d;
+    print "Using Google to lookup the address for the location, $latitude,$longitude\n" if $opt_d;
 
     my $google_reverse_geocode_api_url = sprintf(
         "https://maps.googleapis.com/maps/api/geocode/json?latlng=%s,%s&key=%s",
@@ -533,90 +688,51 @@ sub get_google_reverse_geoloc_info {
         print $RED, "Can't get $google_reverse_geocode_api_url-- ", $NORM, $response->status_line, "\n";
     }
     else {
-        print $GREEN, "Found $google_reverse_geocode_api_url-- ", $NORM, $response->status_line, "\n";
+        print $GREEN, "GET $google_reverse_geocode_api_url-- ", $NORM, $response->status_line, "\n";
 
         if ($opt_d) {
             print $GREEN, "content_type: ", $WHITE, $response->content_type, $NORM, "\n";
             print $RED, "response:\n", $NORM, $response->content;
         }
 
-        my $result = decode_json $response->content;
+        my $revgeo = decode_json $response->content;
 
-        if ($result->{status} eq 'OK') {
-            set_sleep_target();
+        if (defined( $revgeo )) {
+            if ($revgeo->{status} eq 'OK') {
+                set_sleep_target(); # return to default sleep
 
-            foreach my $addr (@{$result->{results}}) {
-                print $GREEN, '"formatted_address" : ', $WHITE, $addr->{formatted_address}, $NORM, "\n";
+                if ($opt_d) {
+                    printf( "%sFound via Google Reverse Geocoding API :: (%sLat: %s, Lon: %s%s)\n", $GREEN, $YELLOW,
+                        $latitude, $longitude, $NORM );
+                    foreach my $addr (@{$revgeo->{results}}) {
+                        print $GREEN, '    "formatted_address" : ', $WHITE, $addr->{formatted_address}, $NORM, "\n";
+                    }
+                }
+
+                my $address = undef;
+                if (defined( $revgeo->{results} ) && scalar @{$revgeo->{results}} > 0) {
+                    $address = google_decode_address_components( ${$revgeo->{results}}[0] );
+
+                    if (defined $address) {
+                        return {
+                            address1 => $address->{address1},
+                            city => $address->{city},
+                            state => $address->{state},
+                            country => $address->{country},
+                            postalcode => $address->{postalcode}
+                        };
+                    }
+                }
+                else {
+                    print $RED, "No results found in reverse geolocation response, only (", join( ", ", keys %$revgeo ), ")\n", $NORM;
+                }
             }
-            return $result;
-        }
-        elsif ($result->{status} eq 'OVER_QUERY_LIMIT') {
-            set_sleep_target( 3600 ); # sleep for an hour
-        }
-
-        print $RED, "reverse geolocation query returned: ", $result->{status}, ": ", $result->{errorMessage}, $NORM,
-            "\n";
-    }
-
-    return undef;
-}
-
-sub get_geoloc {
-    my ($browser, $data_item) = @_;
-    my $result = undef;
-
-    if ($geo_service eq "google") {
-        $result = get_google_geoloc_info($browser, $data_item);
-    }
-
-    return $result;
-}
-
-
-sub get_reverse_geoloc {
-    my ($browser, $latitude, $longitude) = @_;
-    my $result = undef;
-
-    if ($geo_service eq "google") {
-        $result = get_google_reverse_geoloc_info($browser, $latitude, $longitude);
-    }
-
-    return $result;
-}
-
-
-sub get_google_timezone_info {
-    my ($browser, $latitude, $longitude) = @_;
-
-    print "Looking up the timezone for the location, $latitude,$longitude\n" if $opt_d;
-
-    my $google_timezone_api_url = sprintf(
-        "https://maps.googleapis.com/maps/api/timezone/json?location=%s,%s&timestamp=%s&key=%s",
-        $latitude, $longitude, time(), "AIzaSyAT-FsZkd7HuxZDHGk5HUofnzN71ZrFxHA" );
-
-    my $response = $browser->get( $google_timezone_api_url );
-    if (!$response->is_success) {
-        print $RED, "Can't get $google_timezone_api_url -- ", $NORM, $response->status_line, "\n";
-    }
-    else {
-        print $GREEN, "Found $google_timezone_api_url -- ", $NORM, $response->status_line, "\n";
-
-        if ($opt_d) {
-            print $GREEN, "content_type: ", $WHITE, $response->content_type, $NORM, "\n";
-            print $RED, "response:\n", $NORM, $response->content;
+            elsif ($revgeo->{status} eq 'OVER_QUERY_LIMIT') {
+                set_sleep_target( 3600 ); # sleep for an hour
+            }
         }
 
-        my $result = decode_json $response->content;
-
-        if ($result->{status} eq 'OK') {
-            set_sleep_target();
-            return $result;
-        }
-        elsif ($result->{status} eq 'OVER_QUERY_LIMIT') {
-            set_sleep_target( 3600 ); # sleep for an hour
-        }
-
-        print $RED, "timezone query returned: ", $result->{status}, ": ", $result->{errorMessage}, $NORM, "\n";
+        print $RED, "reverse geolocation query returned: ", $revgeo->{status}, ": ", $revgeo->{errorMessage}, $NORM, "\n";
     }
 
     return undef;
@@ -632,17 +748,16 @@ sub google_decode_address_components {
         "postalcode" => ""
     };
 
-    # use the first address
     if (defined($detailed_address->{address_components}) && scalar @{$detailed_address->{address_components}} > 0) {
 
         foreach my $address_component (@{$detailed_address->{address_components}}) {
             if ($opt_d) {
-                print $MAGENTA, "google_decode_address_components: component: [", join( ", ", @{$address_component->{types}} ), "], long: \"", $address_component->{long_name},
-                    "\", short: \"", $address_component->{short_name}, "\"\n", $NORM;
+                print $MAGENTA, "google_decode_address_components: { component: [", join( ", ", @{$address_component->{types}} ), "], long: \"", $address_component->{long_name},
+                    "\", short: \"", $address_component->{short_name}, "\"}\n", $NORM;
             }
 
             if (first { $_ eq "street_number" } @{$address_component->{types}}) {
-                #  if (${$address_component->{types}}[0] eq "street_number") {
+                #  street number
                 if (isNullOrEmpty( $result->{address1} )) {
                     $result->{address1} = $address_component->{short_name};
                 }
@@ -653,7 +768,6 @@ sub google_decode_address_components {
                     $address_component->{short_name}, $result->{address1} ) if $opt_d;
             }
             elsif (first { $_ eq "route" } @{$address_component->{types}}) {
-                # elsif (${$address_component->{types}}[0] eq "route") {
                 # street name
                 if (isNullOrEmpty( $result->{address1} )) {
                     $result->{address1} = $address_component->{long_name};
@@ -665,7 +779,6 @@ sub google_decode_address_components {
                     $address_component->{long_name}, $result->{address1} ) if $opt_d;
             }
             elsif (first { $_ eq "locality" } @{$address_component->{types}}) {
-                # elsif (${$address_component->{types}}[0] eq "locality") {
                 # city
                 $result->{city} = $address_component->{long_name};
                 printf( "%s :: using \"%s\" to create \"%s\"\n", "locality",
@@ -680,27 +793,25 @@ sub google_decode_address_components {
                 }
             }
             elsif (first { $_ eq "administrative_area_level_1" } @{$address_component->{types}}) {
-                # elsif (${$address_component->{types}}[0] eq "administrative_area_level_1") {
                 # US: state
                 $result->{state} = $address_component->{short_name};
                 printf( "%s :: using \"%s\" to create \"%s\"\n", "administrative_area_level_1",
                     $address_component->{short_name}, $result->{state} ) if $opt_d;
             }
             elsif (first { $_ eq "country" } @{$address_component->{types}}) {
-                # elsif (${$address_component->{types}}[0] eq "country") {
+                # country
                 $result->{country} = $address_component->{short_name};
                 printf( "%s :: using \"%s\" to create \"%s\"\n", "country",
                     $address_component->{short_name}, $result->{country} ) if $opt_d;
             }
             elsif (first { $_ eq "postal_code" } @{$address_component->{types}}) {
-                # elsif (${$address_component->{types}}[0] eq "postal_code") {
+                # postal code
                 $result->{postalcode} = $address_component->{short_name};
                 printf( "%s :: using \"%s\" to create \"%s\"\n", "postal_code",
                     $address_component->{short_name}, $result->{postalcode} ) if $opt_d;
             }
             else {
-                print $CYAN, "Ignoring address components: ", join( ", ", @{$address_component->{types}} ), "\n",
-                    $NORM if $opt_d;
+                print $CYAN, "Ignoring address components: ", join( ", ", @{$address_component->{types}} ), "\n", $NORM if $opt_d;
             }
         }
 
@@ -711,6 +822,118 @@ sub google_decode_address_components {
     }
 }
 
+
+# function: get_timezone
+# @params: latitude, longitude
+# @returns hash with the following fields
+#  - housr_offset
+#  - timeZoneId
+#  - timeZoneName
+sub get_timezone {
+    my ($browser, $latitude, $longitude) = @_;
+    my $result = undef;
+
+    if ($geo_service eq "google") {
+        $result = get_google_timezone_info($browser, $latitude, $longitude);
+    }
+    elsif ($geo_service eq "ziptastic") {
+        $result = get_ziptastic_timezone_info($browser, $latitude, $longitude);
+    }
+
+    return $result;
+}
+
+sub get_google_timezone_info {
+    my ($browser, $latitude, $longitude) = @_;
+
+    print "Using Google to lookup the timezone for the location, $latitude,$longitude\n" if $opt_d;
+
+    my $google_timezone_api_url = sprintf(
+        "https://maps.googleapis.com/maps/api/timezone/json?location=%s,%s&timestamp=%s&key=%s",
+        $latitude, $longitude, time(), "AIzaSyAT-FsZkd7HuxZDHGk5HUofnzN71ZrFxHA" );
+
+    my $response = $browser->get( $google_timezone_api_url );
+    if (!$response->is_success) {
+        print $RED, "Can't get $google_timezone_api_url -- ", $NORM, $response->status_line, "\n";
+    }
+    else {
+        print $GREEN, "GET $google_timezone_api_url -- ", $NORM, $response->status_line, "\n";
+
+        if ($opt_d) {
+            print $GREEN, "content_type: ", $WHITE, $response->content_type, $NORM, "\n";
+            print $RED, "response:\n", $NORM, $response->content;
+        }
+
+        my $result = decode_json $response->content;
+
+        if ($result->{status} eq 'OK') {
+            set_sleep_target();
+
+            return {
+                "hours_offset" => ($result->{rawOffset} + $result->{dstOffset}) / 3600.0,
+                "timeZoneId"   => $result->{timeZoneId},
+                "timeZoneName" => $result->{timeZoneName}
+            };
+        }
+        elsif ($result->{status} eq 'OVER_QUERY_LIMIT') {
+            set_sleep_target( 3600 ); # sleep for an hour
+        }
+
+        print $RED, "timezone query returned: ", $result->{status}, ": ", $result->{errorMessage}, $NORM, "\n";
+    }
+
+    return undef;
+}
+
+sub get_ziptastic_timezone_info {
+    my ($browser, $latitude, $longitude) = @_;
+
+    print "Using Ziptastic to lookup the timezone for the location, $latitude,$longitude\n" if $opt_d;
+
+    my $ziptastic_timezone_api_url = sprintf("https://zip.getziptastic.com/v3/reverse/%s/%s", $latitude, $longitude );
+
+    my $response = $browser->get( $ziptastic_timezone_api_url, 'x-key' => '5893afab93d2dd2f6b111d70b06e92c4702b7044' );
+
+    if (!$response->is_success) {
+        print $RED, "Can't get $ziptastic_timezone_api_url -- ", $NORM, $response->status_line, "\n";
+    }
+    else {
+        print $GREEN, "GET $ziptastic_timezone_api_url -- ", $NORM, $response->status_line, "\n";
+
+        if ($opt_d) {
+            print $GREEN, "content_type: ", $WHITE, $response->content_type, $NORM, "\n";
+            print $RED, "response:\n", $NORM, $response->content, "\n";
+        }
+
+        my $result = decode_json $response->content;
+
+        # $result is an array ref
+        my @zips = map { $_->{postal_code} } @{$result};
+        my @zones = map { $_->{timezone} } @{$result};
+        my @uniq_zones = uniq @zones;
+        my $all_or_nothing = (scalar @uniq_zones == 1);
+        printf("%d zip codes found (%s) %s %s\n", scalar @zips, join(", ", @zips),
+                $all_or_nothing ? "all in" : "in timezones ",
+                $all_or_nothing ? $zones[0] : join(", ", @uniq_zones));
+
+        my $now = DateTime->now();
+        my $dt = DateTime->new(year => $now->year, time_zone => "UTC" );
+
+        print "Test day: ", $dt->ymd(), " @ ", $dt->hms(), "\n";
+
+        my $tz = DateTime::TimeZone->new( name => $zones[0] );
+
+        my $offset = $tz->offset_for_datetime($dt);
+
+        return {
+            "hours_offset" => $offset / 3600.0,
+            "timeZoneId"   => $zones[0],
+            "timeZoneName" => ""
+        };
+    }
+
+    return undef;
+}
 
 sub distance {
     my ($lat1, $lng1, $lat2, $lng2) = @_;
