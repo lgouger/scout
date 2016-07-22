@@ -1,0 +1,68 @@
+{
+   "results" : [
+      {
+         "address_components" : [
+            {
+               "long_name" : "3001",
+               "short_name" : "3001",
+               "types" : [ "street_number" ]
+            },
+            {
+               "long_name" : "U.S. 1",
+               "short_name" : "U.S. 1",
+               "types" : [ "route" ]
+            },
+            {
+               "long_name" : "Lawrenceville",
+               "short_name" : "Lawrenceville",
+               "types" : [ "sublocality_level_1", "sublocality", "political" ]
+            },
+            {
+               "long_name" : "Lawrence Township",
+               "short_name" : "Lawrence Township",
+               "types" : [ "locality", "political" ]
+            },
+            {
+               "long_name" : "Mercer County",
+               "short_name" : "Mercer County",
+               "types" : [ "administrative_area_level_2", "political" ]
+            },
+            {
+               "long_name" : "New Jersey",
+               "short_name" : "NJ",
+               "types" : [ "administrative_area_level_1", "political" ]
+            },
+            {
+               "long_name" : "United States",
+               "short_name" : "US",
+               "types" : [ "country", "political" ]
+            },
+            {
+               "long_name" : "08648",
+               "short_name" : "08648",
+               "types" : [ "postal_code" ]
+            }
+         ],
+         "formatted_address" : "3001 U.S. 1, Lawrenceville, NJ 08648, USA",
+         "geometry" : {
+            "location" : {
+               "lat" : 40.2768958,
+               "lng" : -74.705111
+            },
+            "location_type" : "ROOFTOP",
+            "viewport" : {
+               "northeast" : {
+                  "lat" : 40.27824478029149,
+                  "lng" : -74.70376201970849
+               },
+               "southwest" : {
+                  "lat" : 40.2755468197085,
+                  "lng" : -74.70645998029151
+               }
+            }
+         },
+         "types" : [ "street_address" ]
+      }
+   ],
+   "status" : "OK"
+}
